@@ -1,0 +1,137 @@
+---
+- name: Install Docker Engine and deploy Jenkins containers
+  hosts: ci
+  become: yes
+  collections:
+    - community.docker
+
+  vars:
+    docker_registry_url: "{{ lookup('env', 'DOCKER_REGISTRY_URL') }}"
+    docker_registry_username: "{{ lookup('env', 'DOCKER_REGISTRY_USERNAME') }}"
+    docker_registry_password: "{{ lookup('env', 'DOCKER_REGISTRY_PASSWORD') }}"
+    
+  tasks:
+    - name: Add Docker official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+        state: present
+
+    - name: Add Docker repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        filename: docker
+        state: present
+
+    - name: Update apt and install Docker packages
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Add current user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_env.USER }}"
+        groups: docker
+        append: yes
+
+    - name: Log in to Docker registry (Docker Hub)
+      community.docker.docker_login:
+        registry_url: "{{ docker_registry_url }}"
+        username: "{{ docker_registry_username }}"
+        password: "{{ docker_registry_password }}"
+
+    - name: Create Docker network "jenkins"
+      community.docker.docker_network:
+        name: jenkins
+        state: present
+
+    - name: Create Docker volume "jenkins-docker-certs"
+      community.docker.docker_volume:
+        name: jenkins-docker-certs
+        state: present
+
+    - name: Create Docker volume "jenkins-data"
+      community.docker.docker_volume:
+        name: jenkins-data
+        state: present
+
+    - name: Run Jenkins Docker-in-Docker container
+      community.docker.docker_container:
+        name: jenkins-docker
+        image: docker:dind
+        state: started
+        restart_policy: no
+        detach: yes
+        privileged: yes
+        networks:
+          - name: jenkins
+            aliases:
+              - docker
+        env:
+          DOCKER_TLS_CERTDIR: /certs
+        volumes:
+          - jenkins-docker-certs:/certs/client
+          - jenkins-data:/var/jenkins_home
+        published_ports:
+          - "2376:2376"
+        command: --storage-driver overlay2
+
+    - name: Ensure directory for kubeconfig exists
+      ansible.builtin.file:
+        path: /opt/jenkins/kube
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: '0755'
+
+    - name: Copy kubeconfig from local to Jenkins host
+      ansible.builtin.copy:
+        src: ~/.kube/config
+        dest: /opt/jenkins/kube/config
+        owner: 1000
+        group: 1000
+        mode: '0644'
+
+    - name: Run Jenkins Blue Ocean container
+      community.docker.docker_container:
+        name: jenkins-blueocean
+        image: omegavlg/jenkins-blueocean:v1
+        state: started
+        restart_policy: on-failure
+        detach: yes
+        networks:
+          - name: jenkins
+        env:
+          DOCKER_HOST: tcp://docker:2376
+          DOCKER_CERT_PATH: /certs/client
+          DOCKER_TLS_VERIFY: "1"
+        volumes:
+          - jenkins-data:/var/jenkins_home
+          - jenkins-docker-certs:/certs/client:ro
+          - /opt/jenkins/kube/config:/var/jenkins_home/.kube/config:ro
+        published_ports:
+          - "8080:8080"
+          - "50000:50000"
+
+    - name: Wait for Jenkins initialAdminPassword file
+      community.docker.docker_container_exec:
+        container: jenkins-blueocean
+        command: test -f /var/jenkins_home/secrets/initialAdminPassword
+      register: jenkins_password_check
+      retries: 20
+      delay: 5
+      until: jenkins_password_check.rc == 0
+
+    - name: Get Jenkins initial admin password
+      community.docker.docker_container_exec:
+        container: jenkins-blueocean
+        command: cat /var/jenkins_home/secrets/initialAdminPassword
+      register: jenkins_password_result
+
+    - name: Show Jenkins initial admin password
+      ansible.builtin.debug:
+        msg: "Jenkins initial admin password: {{ jenkins_password_result.stdout }}"

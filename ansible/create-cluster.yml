@@ -1,0 +1,211 @@
+---
+- name: Prepare Kubernetes nodes
+  hosts: k8s_nodes
+  become: true
+  vars:
+    sysctl_param:
+      - net.bridge.bridge-nf-call-iptables
+      - net.ipv4.ip_forward
+      - net.bridge.bridge-nf-call-ip6tables
+    packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+
+  tasks:
+    - name: Turn off swap
+      ansible.builtin.command: swapoff -a
+
+    - name: Load modules
+      ansible.builtin.shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Add configuration for automatically modules loaded
+      ansible.builtin.blockinfile:
+        path: /etc/modules-load.d/containerd.conf
+        create: true
+        block: |
+          overlay
+          br_netfilter
+
+    - name: Setup sysctl params
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop: "{{ sysctl_param }}"
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu bionic stable
+        state: present
+
+    - name: Install the containerd package
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+
+    - name: Create a configuration file for containerd and set it to default
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default | tee /etc/containerd/config.toml
+
+    - name: Set cgroupdriver to systemd
+      ansible.builtin.lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        line: SystemdCgroup = true
+
+    - name: Restart containerd package
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+
+    - name: mkdir keyrings
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add gpg key k8s
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key
+        state: present
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add the Kubernetes repository
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /
+        state: present
+
+    - name: Update Repository cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install all Kubernetes modules (kubelet, kubeadm, kubectl)
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: present
+
+    - name: Enable kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: true
+
+# ------------------------
+- name: Initialize Kubernetes Master
+  hosts: k8s-master
+  become: true
+  vars:
+    pod_network_cidr: 10.244.0.0/16
+    master_internal_ip: "{{ ip }}"
+    master_external_ip: "{{ ansible_host }}"
+  tasks:
+    - name: Initialize kubeadm
+      command: >
+        kubeadm init
+        --apiserver-advertise-address={{ master_internal_ip }}
+        --apiserver-cert-extra-sans={{ master_external_ip }},{{ master_internal_ip }}
+        --pod-network-cidr={{ pod_network_cidr }}
+      register: kubeadm_output
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_cmd_raw
+
+    - name: Set join command fact
+      set_fact:
+        join_command: "{{ join_cmd_raw.stdout }}"
+
+    - name: Create .kube directory for user ubuntu
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0755
+
+    - name: Copy kubeconfig to /home/ubuntu/.kube/config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+        remote_src: true
+
+# ------------------------
+- name: Fetch kubeconfig from master to local machine and fix IP
+  hosts: k8s-master
+  gather_facts: false
+  tasks:
+    - name: Fetch admin.conf content from remote master via ssh
+      delegate_to: localhost
+      shell: ssh ubuntu@{{ ansible_host }} "sudo cat /etc/kubernetes/admin.conf"
+      register: kubeconfig_raw
+      changed_when: false
+
+    - name: Save kubeconfig locally
+      delegate_to: localhost
+      copy:
+        content: "{{ kubeconfig_raw.stdout }}"
+        dest: ./admin.conf
+        mode: '0600'
+
+- name: Replace server IP in kubeconfig with external IP and move to ~/.kube/config
+  hosts: localhost
+  gather_facts: false
+  vars:
+    master_external_ip: "{{ hostvars['k8s-master']['ansible_host'] }}"
+  tasks:
+    - name: Replace server IP in kubeconfig with external IP
+      replace:
+        path: ./admin.conf
+        regexp: 'server: https://[0-9.]+:6443'
+        replace: 'server: https://{{ master_external_ip }}:6443'
+
+    - name: Create .kube directory in home if not exists
+      file:
+        path: "{{ lookup('env','HOME') }}/.kube"
+        state: directory
+        mode: '0700'
+
+    - name: Move kubeconfig to ~/.kube/config
+      copy:
+        src: ./admin.conf
+        dest: "{{ lookup('env','HOME') }}/.kube/config"
+        mode: '0600'
+
+# ------------------------
+- name: Apply Flannel CNI
+  hosts: k8s-master
+  become: true
+  tasks:
+    - name: Install Flannel
+      become_user: ubuntu
+      command: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+# ------------------------
+- name: Join Kubernetes Workers to Cluster
+  hosts: k8s-worker-1,k8s-worker-2
+  become: true
+  vars:
+    join_command: "{{ hostvars['k8s-master']['join_command'] }}"
+  tasks:
+    - name: Join the node to the Kubernetes cluster
+      command: "{{ join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf

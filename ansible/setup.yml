@@ -1,0 +1,31 @@
+---
+- name: Initial setup for all nodes
+  hosts: all
+  become: true
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+
+  tasks:
+
+    - name: Set hostname based on inventory_hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Ensure hostname is in /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[inventory_hostname]['ip'] }} {{ inventory_hostname }}"
+        state: present
+
+    - name: Set timezone to Europe/Moscow
+      ansible.builtin.timezone:
+        name: Europe/Moscow
+
+    - name: Run apt update and upgrade
+      ansible.builtin.shell: |
+        apt update && apt upgrade -y
+
+    - name: Reboot the server
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible after updates"
+        reboot_timeout: 600
